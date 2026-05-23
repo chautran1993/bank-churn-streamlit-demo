@@ -1,0 +1,48 @@
+{
+  "best_model_name": "Logistic Regression",
+  "best_threshold": 0.635,
+  "validation_metrics": {
+    "Model": "Logistic Regression",
+    "Threshold_Type": "Optimized_on_Validation",
+    "Threshold": 0.635,
+    "Accuracy": 0.7959166666666667,
+    "Precision_Churn": 0.4571851851851852,
+    "Recall_Churn": 0.7143518518518519,
+    "F1_Churn": 0.557542908762421,
+    "F1_Macro": 0.7124568050446278,
+    "ROC_AUC": 0.855105531090033
+  },
+  "final_test_metrics": {
+    "Accuracy": 0.7924166666666667,
+    "Precision_Churn": 0.45010551703346396,
+    "Recall_Churn": 0.6912037037037037,
+    "F1_Churn": 0.5451889720649991,
+    "F1_Macro": 0.7053537582886136,
+    "ROC_AUC": 0.8575061163806084
+  },
+  "feature_columns": [
+    "credit_sco",
+    "gender",
+    "age",
+    "occupation",
+    "balance",
+    "monthly_ir",
+    "origin_province",
+    "tenure_ye",
+    "married",
+    "nums_card",
+    "nums_service",
+    "active_member",
+    "last_transaction_month",
+    "customer_segment",
+    "engagement_score",
+    "loyalty_level",
+    "digital_behavior"
+  ],
+  "target_column": "exit",
+  "risk_level_rule": {
+    "Low": "probability < 0.3",
+    "Medium": "0.3 <= probability < 0.6",
+    "High": "probability >= 0.6"
+  }
+}
