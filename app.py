@@ -1,474 +1,348 @@
-"""Streamlit dashboard for Amazon Electronics sentiment analysis.
+# -*- coding: utf-8 -*-
+"""Streamlit app for Vietnam bank customer churn prediction.
 
-Run with:
-    streamlit run app.py
+Run:
+    streamlit run app.py --server.port 8501
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
+import joblib
+import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
-import torch
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
 BASE_DIR = Path(__file__).resolve().parent
-LABELED_CSV = BASE_DIR / "data" / "processed" / "amazon_reviews_2023_electronics_labeled.csv"
-COMPARISON_CSV = BASE_DIR / "outputs" / "model_comparison" / "model_comparison.csv"
-RANKING_CSV = BASE_DIR / "outputs" / "amazon_reviews_2023" / "amazon_reviews_2023_product_ranking.csv"
-BERT_MODEL_DIR = BASE_DIR / "models" / "bert"
+MODEL_PATH = BASE_DIR / "model.pkl"
+FALLBACK_MODEL_PATH = BASE_DIR / "best_churn_model.pkl"
+METADATA_PATH = BASE_DIR / "model_metadata.json"
 
-LABEL_MAP = {0: "Negative", 1: "Neutral", 2: "Positive"}
-LABEL_ORDER = ["Negative", "Neutral", "Positive"]
-EXAMPLE_REVIEWS = {
-    "positive": (
-        "This speaker exceeded my expectations. The sound is crisp, the battery lasts all day, "
-        "and setup was incredibly easy."
-    ),
-    "negative": (
-        "Terrible headphones. The right side stopped working after two days and the battery life is awful."
-    ),
-    "ambiguous": (
-        "The tablet is okay for basic tasks, but performance feels average and the display could be better."
-    ),
+PROVINCES = [
+    "TP. Hồ Chí Minh",
+    "Hà Nội",
+    "Đà Nẵng",
+    "Cần Thơ",
+    "Hải Phòng",
+    "Đồng Nai",
+    "Bình Dương",
+    "Bà Rịa - Vũng Tàu",
+    "An Giang",
+    "Bắc Giang",
+    "Bắc Ninh",
+    "Bình Định",
+    "Đắk Lắk",
+    "Gia Lai",
+    "Khánh Hòa",
+    "Lâm Đồng",
+    "Long An",
+    "Nghệ An",
+    "Quảng Ninh",
+    "Thanh Hóa",
+    "Thừa Thiên Huế",
+]
+
+OCCUPATIONS = [
+    "Nhân viên văn phòng/Công chức",
+    "Kinh doanh",
+    "Tự do",
+    "Nghỉ hưu",
+    "Nội trợ/Sinh viên",
+]
+
+INCOME_OPTIONS = {
+    "<5M": 4_000_000,
+    "5-10M": 7_500_000,
+    "10-20M": 15_000_000,
+    "20-50M": 35_000_000,
+    ">50M": 70_000_000,
 }
 
 
-st.set_page_config(page_title="Dashboard cảm xúc Amazon Electronics", layout="wide")
+st.set_page_config(
+    page_title="Dự đoán churn ngân hàng",
+    page_icon="🏦",
+    layout="wide",
+)
 
 
-def inject_styles() -> None:
-    """Add a small visual layer so the dashboard feels more polished."""
-    st.markdown(
-        """
-        <style>
-        .stApp {
-            background:
-                radial-gradient(circle at top, rgba(217, 249, 157, 0.45), transparent 28%),
-                linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
-        }
-        .block-container {
-            padding-top: 1.5rem;
-            padding-bottom: 2rem;
-        }
-        div[data-testid="stMetric"] {
-            background: rgba(255, 255, 255, 0.92);
-            border: 1px solid rgba(226, 232, 240, 0.95);
-            padding: 1rem;
-            border-radius: 1rem;
-            box-shadow: 0 12px 28px rgba(15, 23, 42, 0.06);
-        }
-        div[data-testid="stDataFrame"],
-        div[data-testid="stPlotlyChart"] {
-            background: rgba(255, 255, 255, 0.92);
-            border: 1px solid rgba(226, 232, 240, 0.95);
-            border-radius: 1rem;
-            padding: 0.35rem;
-        }
-        .dashboard-note {
-            background: rgba(255, 255, 255, 0.9);
-            border: 1px solid rgba(226, 232, 240, 0.95);
-            border-radius: 1rem;
-            padding: 1rem 1.1rem;
-            margin-bottom: 1rem;
-            color: #334155;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+st.markdown(
+    """
+    <style>
+    .block-container {
+        max-width: 1280px;
+        padding-top: 2rem;
+        padding-bottom: 2rem;
+    }
+    div[data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #e5e7eb;
+        border-radius: 12px;
+        padding: 18px 20px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05);
+    }
+    div[data-testid="stMetricValue"] {
+        white-space: normal;
+        overflow-wrap: anywhere;
+        font-size: 2rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-@st.cache_data(show_spinner=False)
-def load_csv(path: Path) -> pd.DataFrame:
-    """Load a CSV file once and return an empty frame if it is missing."""
-    if not path.exists():
-        return pd.DataFrame()
-    return pd.read_csv(path)
+@st.cache_resource
+def load_model_artifact() -> tuple[Any | None, dict[str, Any], str | None]:
+    """Load trained model artifact and metadata once."""
+    metadata: dict[str, Any] = {}
+    if METADATA_PATH.exists():
+        with METADATA_PATH.open("r", encoding="utf-8") as file:
+            metadata = json.load(file)
 
-
-@st.cache_resource(show_spinner=False)
-def load_bert_resources(model_dir: Path) -> tuple[Any | None, Any | None, str | None]:
-    """Load tokenizer and model once, returning a warning message on failure."""
-    if not model_dir.exists():
-        return None, None, f"Không tìm thấy checkpoint BERT tại `{model_dir}`."
+    model_path = MODEL_PATH if MODEL_PATH.exists() else FALLBACK_MODEL_PATH
+    if not model_path.exists():
+        return None, metadata, "Please train and export the best model first."
 
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_dir)
-        model = AutoModelForSequenceClassification.from_pretrained(model_dir)
-        model.eval()
-        return tokenizer, model, None
-    except Exception as exc:  # pragma: no cover - defensive UI path
-        return None, None, f"Không thể load checkpoint BERT: {exc}"
+        artifact = joblib.load(model_path)
+        return artifact, metadata, None
+    except Exception as exc:  # pragma: no cover - user-facing Streamlit branch
+        return None, metadata, f"Không thể load model: {exc}"
 
 
-def safe_percentage(series: pd.Series, positive_value: int | str) -> float:
-    """Compute a percentage safely for summary metrics."""
-    if series.empty:
-        return 0.0
-    return float((series == positive_value).mean() * 100.0)
+def get_pipeline(artifact: Any) -> Any:
+    """Support both a raw pipeline and a dict artifact from the notebook."""
+    if isinstance(artifact, dict) and "pipeline" in artifact:
+        return artifact["pipeline"]
+    return artifact
 
 
-def infer_with_bert(review_text: str) -> tuple[str, list[float]]:
-    """Run BERT inference when a checkpoint is available."""
-    tokenizer, model, warning_message = load_bert_resources(BERT_MODEL_DIR)
-    if tokenizer is None or model is None:
-        raise RuntimeError(warning_message or "BERT model is not available.")
-
-    encoded = tokenizer(
-        review_text,
-        truncation=True,
-        padding=True,
-        max_length=256,
-        return_tensors="pt",
-    )
-    with torch.no_grad():
-        outputs = model(**encoded)
-        probabilities = torch.softmax(outputs.logits, dim=-1).squeeze(0).tolist()
-
-    predicted_index = int(torch.tensor(probabilities).argmax().item())
-    return LABEL_MAP[predicted_index], [float(value) for value in probabilities]
+def get_threshold(artifact: Any, metadata: dict[str, Any]) -> float:
+    # UI should follow the reviewed notebook metadata. Some older exported
+    # artifacts may still contain a previous threshold.
+    if "best_threshold" in metadata:
+        return float(metadata["best_threshold"])
+    if isinstance(artifact, dict) and "best_threshold" in artifact:
+        return float(artifact["best_threshold"])
+    return 0.5
 
 
-def infer_with_fallback(review_text: str) -> tuple[str, list[float]]:
-    """Use a transparent keyword-based fallback so the UI remains demoable."""
-    text = review_text.lower()
-    positive_keywords = [
-        "excellent",
-        "great",
-        "amazing",
-        "perfect",
-        "love",
-        "good",
-        "satisfied",
-        "easy",
-        "fast",
-        "reliable",
-    ]
-    negative_keywords = [
-        "bad",
-        "terrible",
-        "awful",
-        "broken",
-        "poor",
-        "hate",
-        "disappointing",
-        "slow",
-        "worse",
-        "problem",
-    ]
-
-    positive_score = sum(keyword in text for keyword in positive_keywords)
-    negative_score = sum(keyword in text for keyword in negative_keywords)
-    neutral_score = 1.0
-
-    raw_scores = torch.tensor(
-        [
-            1.0 + float(negative_score) * 1.6,
-            neutral_score + (0.3 if positive_score == negative_score else 0.0),
-            1.0 + float(positive_score) * 1.6,
-        ],
-        dtype=torch.float32,
-    )
-    probabilities = torch.softmax(raw_scores, dim=0).tolist()
-    predicted_index = int(torch.argmax(raw_scores).item())
-    return LABEL_MAP[predicted_index], [float(value) for value in probabilities]
+def get_feature_columns(artifact: Any, metadata: dict[str, Any]) -> list[str]:
+    if isinstance(artifact, dict) and "feature_columns" in artifact:
+        return list(artifact["feature_columns"])
+    return list(metadata.get("feature_columns", []))
 
 
-def build_probability_chart(probabilities: list[float]) -> Any:
-    """Create a horizontal probability bar chart."""
-    chart_df = pd.DataFrame(
-        {
-            "Nhãn": LABEL_ORDER,
-            "Xác suất": probabilities,
-        }
-    )
-    return px.bar(
-        chart_df,
-        x="Xác suất",
-        y="Nhãn",
-        orientation="h",
-        color="Nhãn",
-        color_discrete_map={
-            "Negative": "#ef4444",
-            "Neutral": "#f59e0b",
-            "Positive": "#22c55e",
-        },
-        text="Xác suất",
-    ).update_traces(texttemplate="%{text:.2%}", textposition="outside").update_layout(
-        height=300,
-        showlegend=False,
-        xaxis_tickformat=".0%",
-        margin=dict(l=10, r=10, t=20, b=10),
-    )
+def predict_probability(pipeline: Any, input_df: pd.DataFrame) -> float:
+    """Return churn probability from a trained sklearn/imblearn pipeline."""
+    if hasattr(pipeline, "predict_proba"):
+        proba = pipeline.predict_proba(input_df)
+        if proba.ndim == 2 and proba.shape[1] > 1:
+            return float(proba[0, 1])
+        return float(proba[0])
+
+    if hasattr(pipeline, "decision_function"):
+        score = float(pipeline.decision_function(input_df)[0])
+        return float(1 / (1 + np.exp(-score)))
+
+    prediction = int(pipeline.predict(input_df)[0])
+    return float(prediction)
 
 
-def render_missing_file(path: Path, label: str) -> None:
-    """Render a consistent warning for missing optional data files."""
-    st.warning(f"Không tìm thấy {label}: `{path}`. Tab này sẽ hiển thị ở chế độ tối giản.")
+def risk_from_probability(probability: float) -> tuple[str, str]:
+    if probability >= 0.60:
+        return "Nguy cơ cao", "Churn"
+    if probability >= 0.30:
+        return "Nguy cơ trung bình", "Not Churn"
+    return "Nguy cơ thấp", "Not Churn"
 
 
-def render_eda() -> None:
-    """Render the EDA tab."""
-    st.subheader("Tổng quan dữ liệu review")
-    st.markdown(
-        "<div class='dashboard-note'>Tab này cho bạn cái nhìn nhanh về cấu trúc dữ liệu, phân bố nhãn và độ dài review.</div>",
-        unsafe_allow_html=True,
-    )
-    reviews_df = load_csv(LABELED_CSV)
-    if reviews_df.empty:
-        render_missing_file(LABELED_CSV, "file dữ liệu đã gán nhãn")
-        return
-
-    total_reviews = len(reviews_df)
-    unique_products = reviews_df["parent_asin"].nunique() if "parent_asin" in reviews_df.columns else 0
-    positive_pct = safe_percentage(reviews_df.get("label_id", pd.Series(dtype="int64")), 2)
-
-    metric_col1, metric_col2, metric_col3 = st.columns(3)
-    metric_col1.metric("Tổng số review", f"{total_reviews:,}")
-    metric_col2.metric("Số parent_asin", f"{unique_products:,}")
-    metric_col3.metric("% Positive", f"{positive_pct:.2f}%")
-
-    chart_col1, chart_col2, chart_col3 = st.columns(3)
-
-    with chart_col1:
-        rating_df = (
-            reviews_df["rating"]
-            .value_counts()
-            .sort_index()
-            .reindex([1, 2, 3, 4, 5], fill_value=0)
-            .rename_axis("Rating")
-            .reset_index(name="Số lượng")
+def recommendation_for_risk(risk_level: str) -> str:
+    if risk_level == "Nguy cơ cao":
+        return (
+            "Khách hàng có nguy cơ rời bỏ cao. Khuyến nghị: gọi điện tư vấn "
+            "trong 7 ngày, đề xuất ưu đãi lãi suất hoặc gói dịch vụ phù hợp."
         )
-        fig_rating = px.bar(rating_df, x="Rating", y="Số lượng", title="Phân bố rating")
-        fig_rating.update_layout(height=360)
-        st.plotly_chart(fig_rating, use_container_width=True)
-
-    with chart_col2:
-        label_name_map = {0: "Negative", 1: "Neutral", 2: "Positive"}
-        sentiment_df = (
-            reviews_df["label_id"]
-            .map(label_name_map)
-            .fillna(reviews_df.get("sentiment_label", pd.Series(dtype="object")))
-            .value_counts()
-            .reindex(LABEL_ORDER, fill_value=0)
-            .rename_axis("Sentiment")
-            .reset_index(name="Số lượng")
+    if risk_level == "Nguy cơ trung bình":
+        return (
+            "Theo dõi sát hơn. Khuyến nghị: gửi email chăm sóc, khảo sát trải nghiệm "
+            "và mời tham gia chương trình loyalty."
         )
-        fig_sentiment = px.bar(
-            sentiment_df,
-            x="Sentiment",
-            y="Số lượng",
-            title="Phân bố nhãn cảm xúc",
-            color="Sentiment",
-            color_discrete_map={
-                "Negative": "#ef4444",
-                "Neutral": "#f59e0b",
-                "Positive": "#22c55e",
-            },
+    return "Khách hàng ổn định. Khuyến nghị: tiếp tục duy trì chất lượng dịch vụ hiện tại."
+
+
+def build_input_form() -> pd.DataFrame:
+    """Create sidebar form and return one customer record."""
+    st.sidebar.title("Thông tin khách hàng")
+
+    with st.sidebar.expander("1. Thông tin cá nhân", expanded=True):
+        age = st.number_input("Tuổi", min_value=18, max_value=80, value=35, step=1)
+        gender_label = st.selectbox("Giới tính", ["Nam", "Nữ"])
+        origin_province = st.selectbox("Tỉnh thành", PROVINCES)
+        occupation = st.selectbox("Nghề nghiệp", OCCUPATIONS)
+        married_label = st.selectbox("Hôn nhân", ["Có", "Không"])
+
+    with st.sidebar.expander("2. Thông tin tài chính", expanded=True):
+        balance = st.number_input(
+            "Số dư tài khoản",
+            min_value=0,
+            max_value=500_000_000,
+            value=30_000_000,
+            step=1_000_000,
+            format="%d",
         )
-        fig_sentiment.update_layout(height=360, showlegend=False)
-        st.plotly_chart(fig_sentiment, use_container_width=True)
+        credit_sco = st.slider("Điểm tín dụng", min_value=300, max_value=850, value=650)
+        income_label = st.selectbox("Thu nhập hàng tháng", list(INCOME_OPTIONS.keys()), index=2)
+        tenure_ye = st.slider("Số năm gắn bó", min_value=0, max_value=15, value=3)
+        nums_card = st.selectbox("Số thẻ", [1, 2, 3, 4], index=1)
+        nums_service = st.selectbox("Số sản phẩm", [1, 2, 3, 4, 5], index=2)
 
-    with chart_col3:
-        if "word_count" in reviews_df.columns:
-            fig_length = px.histogram(
-                reviews_df,
-                x="word_count",
-                nbins=40,
-                title="Phân bố độ dài review",
-            )
-            fig_length.update_layout(height=360)
-            st.plotly_chart(fig_length, use_container_width=True)
-        else:
-            st.warning("Thiếu cột `word_count`, không thể vẽ histogram độ dài review.")
+    with st.sidebar.expander("3. Thông tin hành vi", expanded=True):
+        active_label = st.selectbox("Thành viên tích cực", ["Có", "Không"])
+        last_transaction_month = st.slider("Tháng giao dịch gần nhất", min_value=1, max_value=12, value=6)
+        engagement_score = st.slider("Engagement score", min_value=1, max_value=100, value=50)
+        loyalty_level = st.selectbox("Loyalty level", ["Bronze", "Silver", "Gold"])
+        digital_behavior = st.selectbox("Digital behavior", ["offline", "mobile"])
+        customer_segment = st.selectbox("Customer segment", ["Mass", "Emerging", "Affluent", "Priority"])
 
+    st.sidebar.divider()
+    st.sidebar.caption("Nhóm 3 - Demo Machine Learning")
 
-def render_comparison() -> None:
-    """Render the model comparison tab."""
-    st.subheader("So sánh hiệu năng mô hình")
-    st.markdown(
-        "<div class='dashboard-note'>Macro F1 được ưu tiên vì bài toán có 3 lớp cảm xúc và cần cân bằng giữa các lớp.</div>",
-        unsafe_allow_html=True,
-    )
-    comparison_df = load_csv(COMPARISON_CSV)
-    if comparison_df.empty:
-        render_missing_file(COMPARISON_CSV, "file so sánh mô hình")
-        return
-
-    display_columns = ["model_name", "accuracy", "precision", "recall", "macro_f1"]
-    available_columns = [column for column in display_columns if column in comparison_df.columns]
-    styled_df = comparison_df[available_columns].copy()
-    styled = styled_df.style.format(
-        {
-            "accuracy": "{:.2%}",
-            "precision": "{:.2%}",
-            "recall": "{:.2%}",
-            "macro_f1": "{:.4f}",
-        }
-    ).background_gradient(subset=["macro_f1"], cmap="YlGn")
-    st.dataframe(styled, use_container_width=True)
-
-    fig = px.bar(
-        comparison_df.sort_values("macro_f1", ascending=True),
-        x="macro_f1",
-        y="model_name",
-        orientation="h",
-        title="So sánh macro F1 giữa các mô hình",
-        text="macro_f1",
-    )
-    fig.update_traces(texttemplate="%{text:.4f}", textposition="outside")
-    fig.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-    best_row = comparison_df.sort_values("macro_f1", ascending=False).iloc[0]
-    st.success(
-        f"Mô hình tốt nhất theo macro_f1 là `{best_row['model_name']}` với điểm `{best_row['macro_f1']:.4f}`."
-    )
+    record = {
+        "credit_sco": int(credit_sco),
+        "gender": "male" if gender_label == "Nam" else "female",
+        "age": int(age),
+        "occupation": occupation,
+        "balance": int(balance),
+        "monthly_ir": int(INCOME_OPTIONS[income_label]),
+        "origin_province": origin_province,
+        "tenure_ye": int(tenure_ye),
+        "married": 1 if married_label == "Có" else 0,
+        "nums_card": int(nums_card),
+        "nums_service": int(nums_service),
+        "active_member": True if active_label == "Có" else False,
+        "last_transaction_month": int(last_transaction_month),
+        "customer_segment": customer_segment,
+        "engagement_score": int(engagement_score),
+        "loyalty_level": loyalty_level,
+        "digital_behavior": digital_behavior,
+    }
+    return pd.DataFrame([record])
 
 
-def render_ranking() -> None:
-    """Render the product ranking tab."""
-    st.subheader("Bảng xếp hạng sản phẩm tiềm năng")
-    st.markdown(
-        "<div class='dashboard-note'>Tab này giúp ưu tiên các sản phẩm vừa có cảm xúc tích cực vừa có khối lượng review đủ lớn.</div>",
-        unsafe_allow_html=True,
-    )
-    ranking_df = load_csv(RANKING_CSV)
-    if ranking_df.empty:
-        render_missing_file(RANKING_CSV, "file xếp hạng sản phẩm")
-        return
+def show_model_info(metadata: dict[str, Any], threshold: float, using_real_model: bool) -> None:
+    model_name = metadata.get("best_model_name", "Model đã huấn luyện")
+    pipeline_name = metadata.get("best_pipeline", "Pipeline đã huấn luyện")
+    status = "Model thật đã được tải" if using_real_model else "Chưa có model thật"
+    st.info(f"{status}: {pipeline_name} · {model_name} · Threshold {threshold:.3f}")
 
-    st.info(
-        "Công thức: product_potential_score = 0.7 × normalized_sentiment_mean + "
-        "0.3 × normalized_review_volume."
-    )
-    top_n = st.slider("Chọn số lượng sản phẩm top", min_value=5, max_value=20, value=10, step=1)
-
-    top_df = ranking_df.sort_values("product_potential_score", ascending=False).head(top_n).copy()
-
-    fig = px.bar(
-        top_df,
-        x="parent_asin",
-        y="product_potential_score",
-        color="product_potential_score",
-        title=f"Top {top_n} sản phẩm theo product_potential_score",
-        text="product_potential_score",
-    )
-    fig.update_traces(texttemplate="%{text:.4f}", textposition="outside")
-    fig.update_layout(height=420, xaxis_title="parent_asin", yaxis_title="product_potential_score")
-    st.plotly_chart(fig, use_container_width=True)
-
-    table_columns = [
-        "parent_asin",
-        "review_count",
-        "sentiment_score_mean",
-        "positive_ratio",
-        "product_potential_score",
-    ]
-    available_columns = [column for column in table_columns if column in top_df.columns]
-    st.dataframe(
-        top_df[available_columns].style.format(
-            {
-                "sentiment_score_mean": "{:.4f}",
-                "positive_ratio": "{:.2%}",
-                "product_potential_score": "{:.4f}",
-            }
-        ),
-        use_container_width=True,
-    )
+    metrics = metadata.get("final_test_metrics") or metadata.get("validation_metrics") or {}
+    if metrics:
+        with st.expander("Thông tin model và metric", expanded=False):
+            st.write(f"**Pipeline:** {metrics.get('Pipeline', pipeline_name)}")
+            st.write(f"**Model:** {metrics.get('Model', model_name)}")
+            st.write(f"**Threshold tối ưu trên validation:** {float(metrics.get('Threshold', threshold)):.3f}")
+            metric_cols = st.columns(5)
+            for col, key, label in zip(
+                metric_cols,
+                ["Accuracy", "Precision_Churn", "Recall_Churn", "F1_Churn", "ROC_AUC"],
+                ["Accuracy", "Precision", "Recall", "F1 churn", "ROC-AUC"],
+            ):
+                value = metrics.get(key)
+                if value is not None:
+                    col.metric(label, f"{float(value):.3f}")
 
 
-def handle_example_buttons() -> None:
-    """Update the review text area from example buttons."""
-    button_col1, button_col2, button_col3 = st.columns(3)
-    if button_col1.button("Ví dụ tích cực", use_container_width=True):
-        st.session_state["review_input"] = EXAMPLE_REVIEWS["positive"]
-    if button_col2.button("Ví dụ tiêu cực", use_container_width=True):
-        st.session_state["review_input"] = EXAMPLE_REVIEWS["negative"]
-    if button_col3.button("Ví dụ mơ hồ", use_container_width=True):
-        st.session_state["review_input"] = EXAMPLE_REVIEWS["ambiguous"]
+def show_result(input_df: pd.DataFrame, probability: float, threshold: float, using_real_model: bool) -> None:
+    risk_level, default_label = risk_from_probability(probability)
+    prediction = "Churn" if probability >= threshold else "Not Churn"
+    recommendation = recommendation_for_risk(risk_level)
 
-
-def render_predict() -> None:
-    """Render the real-time prediction tab."""
-    st.subheader("Dự đoán cảm xúc theo thời gian thực")
-    st.caption("Mô hình hiện chỉ xử lý review bằng TIẾNG ANH.")
-    st.markdown(
-        "<div class='dashboard-note'>Nếu checkpoint BERT load thành công, app sẽ dùng mô hình thật. "
-        "Nếu không, app tự động chuyển sang chế độ <strong>DEMO FALLBACK</strong> để bạn vẫn demo được giao diện.</div>",
-        unsafe_allow_html=True,
-    )
-
-    warning_message = None
-    if not BERT_MODEL_DIR.exists():
-        warning_message = f"Không tìm thấy model tại `{BERT_MODEL_DIR}`. Sẽ dùng DEMO FALLBACK."
+    if risk_level == "Nguy cơ cao":
+        st.error(f"{risk_level.upper()} | Xác suất churn: {probability:.2%} | Dự đoán: {prediction}")
+    elif risk_level == "Nguy cơ trung bình":
+        st.warning(f"{risk_level.upper()} | Xác suất churn: {probability:.2%} | Dự đoán: {prediction}")
     else:
-        _, _, load_warning = load_bert_resources(BERT_MODEL_DIR)
-        warning_message = load_warning
+        st.success(f"{risk_level.upper()} | Xác suất churn: {probability:.2%} | Dự đoán: {prediction}")
 
-    if warning_message:
-        st.warning(warning_message)
+    col1, col2, col3 = st.columns([1, 1, 1.4])
+    col1.metric("Xác suất churn", f"{probability:.2%}", "Model thật" if using_real_model else "Demo")
+    col2.metric("Dự đoán", prediction, f"Threshold {threshold:.3f}")
+    col3.metric("Mức rủi ro", risk_level)
 
-    if "review_input" not in st.session_state:
-        st.session_state["review_input"] = ""
+    st.markdown(f"**Khuyến nghị:** {recommendation}")
+    st.progress(min(max(probability, 0.0), 1.0))
 
-    handle_example_buttons()
-    review_text = st.text_area(
-        "Nhập nội dung review",
-        key="review_input",
-        placeholder="Paste một review tiếng Anh vào đây...",
-        height=180,
-    )
-
-    if st.button("Phân tích", type="primary"):
-        if not review_text.strip():
-            st.warning("Vui lòng nhập review trước khi phân tích.")
-            return
-
-        used_fallback = False
-        try:
-            predicted_label, probabilities = infer_with_bert(review_text)
-        except Exception:
-            predicted_label, probabilities = infer_with_fallback(review_text)
-            used_fallback = True
-
-        result_col1, result_col2 = st.columns([0.35, 0.65])
-        with result_col1:
-            if used_fallback:
-                st.info("Kết quả đang dùng DEMO FALLBACK.")
-            st.metric("Nhãn dự đoán", predicted_label)
-            st.metric("Độ tin cậy", f"{max(probabilities):.2%}")
-
-        with result_col2:
-            st.plotly_chart(build_probability_chart(probabilities), use_container_width=True)
+    left, right = st.columns([1, 1])
+    with left:
+        st.subheader("Diễn giải nhanh")
+        st.write(
+            "- Xác suất churn là khả năng khách hàng rời bỏ dịch vụ theo model.\n"
+            "- Dự đoán Churn/Not Churn được quyết định bằng threshold đã tối ưu khi train.\n"
+            "- Mức rủi ro Low/Medium/High giúp ngân hàng ưu tiên hành động chăm sóc."
+        )
+    with right:
+        st.subheader("Input Summary")
+        summary = {
+            "Điểm tín dụng": f"{input_df.loc[0, 'credit_sco']}",
+            "Giới tính": input_df.loc[0, "gender"],
+            "Tuổi": f"{input_df.loc[0, 'age']}",
+            "Nghề nghiệp": input_df.loc[0, "occupation"],
+            "Số dư tài khoản": f"{int(input_df.loc[0, 'balance']):,} VND",
+            "Thu nhập hàng tháng": f"{int(input_df.loc[0, 'monthly_ir']):,} VND",
+            "Tỉnh thành": input_df.loc[0, "origin_province"],
+            "Số năm gắn bó": f"{input_df.loc[0, 'tenure_ye']}",
+            "Số thẻ": f"{input_df.loc[0, 'nums_card']}",
+            "Số sản phẩm": f"{input_df.loc[0, 'nums_service']}",
+            "Thành viên tích cực": "Có" if bool(input_df.loc[0, "active_member"]) else "Không",
+            "Engagement score": f"{input_df.loc[0, 'engagement_score']}",
+        }
+        st.dataframe(pd.DataFrame(summary.items(), columns=["Thông tin", "Giá trị"]), use_container_width=True)
 
 
 def main() -> None:
-    """Build and render the Streamlit dashboard."""
-    inject_styles()
-    st.title("Dashboard phân tích cảm xúc Amazon Electronics")
-    tab_eda, tab_compare, tab_ranking, tab_predict = st.tabs(
-        [
-            "Phân tích dữ liệu (EDA)",
-            "So sánh mô hình",
-            "Xếp hạng sản phẩm tiềm năng",
-            "Dự đoán cảm xúc (real-time)",
-        ]
-    )
+    artifact, metadata, load_error = load_model_artifact()
+    using_real_model = artifact is not None and load_error is None
+    threshold = get_threshold(artifact, metadata) if using_real_model else float(metadata.get("best_threshold", 0.5))
 
-    with tab_eda:
-        render_eda()
-    with tab_compare:
-        render_comparison()
-    with tab_ranking:
-        render_ranking()
-    with tab_predict:
-        render_predict()
+    st.title("🏦 Dự đoán khả năng rời bỏ dịch vụ ngân hàng")
+    st.caption("Demo Machine Learning hỗ trợ nhận diện khách hàng có nguy cơ churn và đề xuất hành động chăm sóc phù hợp.")
+
+    input_df = build_input_form()
+    show_model_info(metadata, threshold, using_real_model)
+
+    predict_clicked = st.sidebar.button("Dự đoán ngay", use_container_width=True, type="primary")
+    st.subheader("Kết quả dự đoán")
+
+    if load_error:
+        st.warning(load_error)
+
+    if predict_clicked:
+        if using_real_model:
+            pipeline = get_pipeline(artifact)
+            feature_columns = get_feature_columns(artifact, metadata)
+            missing_cols = [col for col in feature_columns if col not in input_df.columns]
+            if missing_cols:
+                st.error(f"Input thiếu cột bắt buộc: {missing_cols}")
+                return
+
+            try:
+                model_input = input_df[feature_columns] if feature_columns else input_df
+                probability = predict_probability(pipeline, model_input)
+            except Exception as exc:
+                st.error(f"Lỗi khi dự đoán: {exc}")
+                return
+        else:
+            probability = 0.42
+
+        show_result(input_df, probability, threshold, using_real_model)
+    else:
+        st.write("Nhập thông tin khách hàng ở sidebar, sau đó bấm **Dự đoán ngay** để xem kết quả.")
 
 
 if __name__ == "__main__":
